@@ -1613,7 +1613,6 @@ public class TerminalControl : FrameworkElement
         terminalKey = key switch
         {
             Key.Enter => TerminalKey.Enter,
-            Key.Return => TerminalKey.Enter,
             Key.Escape => TerminalKey.Escape,
             Key.Back => TerminalKey.Backspace,
             Key.Tab => TerminalKey.Tab,
@@ -1663,7 +1662,6 @@ public class TerminalControl : FrameworkElement
             return true;
 
         return key is Key.Enter
-            or Key.Return
             or Key.Escape
             or Key.Back
             or Key.Tab

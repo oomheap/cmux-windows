@@ -290,10 +290,10 @@ public static class Program
                     result[key] = "true";
                 }
             }
-            else if (arg.StartsWith('-', StringComparison.Ordinal) && arg.Length == 2)
+            else if (arg.StartsWith("-", StringComparison.Ordinal) && arg.Length == 2)
             {
                 var key = arg[1..];
-                if (i + 1 < args.Length && !args[i + 1].StartsWith('-', StringComparison.Ordinal))
+                if (i + 1 < args.Length && !args[i + 1].StartsWith("-", StringComparison.Ordinal))
                 {
                     result[key] = args[i + 1];
                     i++;
