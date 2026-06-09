@@ -219,6 +219,136 @@ public class TerminalBufferTests
         buffer.CursorRow.Should().Be(5);
         buffer.CursorCol.Should().Be(10);
     }
+
+    [Fact]
+    public void WriteChar_WideCharacter_OccupiesTwoCells()
+    {
+        var buffer = new TerminalBuffer(4, 1);
+
+        buffer.WriteChar('\u4E2D');
+        buffer.WriteChar('A');
+
+        buffer.CursorCol.Should().Be(3);
+        buffer.CellAt(0, 0).Character.Should().Be('\u4E2D');
+        buffer.CellAt(0, 0).Width.Should().Be(2);
+        buffer.CellAt(0, 1).Width.Should().Be(0);
+        buffer.CellAt(0, 2).Character.Should().Be('A');
+        buffer.ExportPlainText().Should().Be("\u4E2DA");
+    }
+
+    [Fact]
+    public void WriteChar_WideCharacterAtLastColumn_WrapsBeforeWriting()
+    {
+        var buffer = new TerminalBuffer(3, 2);
+        buffer.WriteString("AB");
+
+        buffer.WriteChar('\u4E2D');
+
+        buffer.CellAt(0, 0).Character.Should().Be('A');
+        buffer.CellAt(0, 1).Character.Should().Be('B');
+        buffer.CellAt(1, 0).Character.Should().Be('\u4E2D');
+        buffer.CellAt(1, 1).Width.Should().Be(0);
+        buffer.CursorRow.Should().Be(1);
+        buffer.CursorCol.Should().Be(2);
+    }
+
+    [Fact]
+    public void EraseChars_OnWideContinuation_ClearsWholeCharacter()
+    {
+        var buffer = new TerminalBuffer(4, 1);
+        buffer.WriteChar('\u4E2D');
+        buffer.MoveCursorTo(0, 1);
+
+        buffer.EraseChars(1);
+
+        buffer.CellAt(0, 0).Character.Should().Be(' ');
+        buffer.CellAt(0, 0).Width.Should().Be(1);
+        buffer.CellAt(0, 1).Character.Should().Be(' ');
+        buffer.CellAt(0, 1).Width.Should().Be(1);
+    }
+
+    [Fact]
+    public void Resize_Wider_ReflowsSoftWrappedLine()
+    {
+        var buffer = new TerminalBuffer(5, 3);
+        buffer.WriteString("abcdefghij");
+
+        buffer.Resize(10, 3);
+
+        GetScreenLine(buffer, 0).Should().StartWith("abcdefghij");
+        buffer.CursorRow.Should().Be(0);
+        buffer.CursorCol.Should().Be(9);
+    }
+
+    [Fact]
+    public void Resize_Narrower_ReflowsLongLine()
+    {
+        var buffer = new TerminalBuffer(10, 4);
+        buffer.WriteString("abcdef");
+
+        buffer.Resize(3, 4);
+
+        GetScreenLine(buffer, 0).Should().Be("abc");
+        GetScreenLine(buffer, 1).Should().Be("def");
+    }
+
+    [Fact]
+    public void Resize_Wider_PreservesHardLineBreaks()
+    {
+        var buffer = new TerminalBuffer(5, 3);
+        buffer.WriteString("abc");
+        buffer.NewLine();
+        buffer.WriteString("def");
+
+        buffer.Resize(10, 3);
+
+        GetScreenLine(buffer, 0).Should().StartWith("abc");
+        GetScreenLine(buffer, 1).Should().StartWith("def");
+    }
+
+    [Fact]
+    public void Resize_Wider_ReflowsWideCells()
+    {
+        var buffer = new TerminalBuffer(4, 3);
+        buffer.WriteString("\u4E2DAB\u4E2D");
+
+        buffer.Resize(8, 3);
+
+        buffer.CellAt(0, 0).Character.Should().Be('\u4E2D');
+        buffer.CellAt(0, 0).Width.Should().Be(2);
+        buffer.CellAt(0, 1).Width.Should().Be(0);
+        buffer.CellAt(0, 2).Character.Should().Be('A');
+        buffer.CellAt(0, 3).Character.Should().Be('B');
+        buffer.CellAt(0, 4).Character.Should().Be('\u4E2D');
+        buffer.CellAt(0, 5).Width.Should().Be(0);
+        buffer.CursorRow.Should().Be(0);
+        buffer.CursorCol.Should().Be(6);
+    }
+
+    private static string GetScreenLine(TerminalBuffer buffer, int row)
+    {
+        var sb = new StringBuilder();
+        for (int col = 0; col < buffer.Cols; col++)
+        {
+            var cell = buffer.CellAt(row, col);
+            if (cell.Width == 0)
+                continue;
+            sb.Append(cell.Character == '\0' ? ' ' : cell.Character);
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+}
+
+public class TerminalWidthTests
+{
+    [Fact]
+    public void GetWidth_ClassifiesAsciiWideAndCombining()
+    {
+        TerminalWidth.GetWidth('A').Should().Be(1);
+        TerminalWidth.GetWidth('\u4E2D').Should().Be(2);
+        TerminalWidth.GetWidth('\u0301').Should().Be(0);
+    }
 }
 
 public class OscHandlerTests
@@ -473,6 +603,98 @@ public class TerminalSelectionTests
     }
 
     [Fact]
+    public void GetSelectedText_WideCharacter_DoesNotCopyContinuationCell()
+    {
+        var buffer = new TerminalBuffer(10, 1);
+        buffer.WriteString("\u4E2DA");
+
+        var selection = new TerminalSelection();
+        selection.StartSelection(0, 0);
+        selection.ExtendSelection(0, 2);
+
+        var text = selection.GetSelectedText(buffer);
+        text.Should().Be("\u4E2DA");
+    }
+
+    [Fact]
+    public void RestoreAfterResize_ReflowsSelectionAcrossSoftWrappedLine()
+    {
+        var buffer = new TerminalBuffer(5, 3);
+        buffer.WriteString("abcdefghij");
+
+        var selection = new TerminalSelection();
+        selection.StartSelection(0, 1);
+        selection.ExtendSelection(1, 2);
+        var snapshot = selection.CaptureForResize(buffer);
+
+        buffer.Resize(10, 3);
+
+        selection.RestoreAfterResize(buffer, snapshot!.Value).Should().BeTrue();
+        selection.Start.Should().Be(new SelectionPoint(0, 1));
+        selection.End.Should().Be(new SelectionPoint(0, 7));
+        selection.GetSelectedText(buffer).Should().Be("bcdefgh");
+    }
+
+    [Fact]
+    public void RestoreAfterResize_PreservesAnchorAtSoftWrapBoundary()
+    {
+        var buffer = new TerminalBuffer(5, 3);
+        buffer.WriteString("abcdefghij");
+
+        var selection = new TerminalSelection();
+        selection.StartSelection(1, 0);
+        selection.ExtendSelection(1, 2);
+        var snapshot = selection.CaptureForResize(buffer);
+
+        buffer.Resize(5, 3);
+
+        selection.RestoreAfterResize(buffer, snapshot!.Value).Should().BeTrue();
+        selection.Start.Should().Be(new SelectionPoint(1, 0));
+        selection.End.Should().Be(new SelectionPoint(1, 2));
+        selection.GetSelectedText(buffer).Should().Be("fgh");
+    }
+
+    [Fact]
+    public void RestoreAfterResize_MapsSelectionCapturedFromScrollbackViewport()
+    {
+        var buffer = new TerminalBuffer(5, 2);
+        buffer.WriteString("abcdefghijklmno");
+
+        var selection = new TerminalSelection();
+        selection.StartSelection(0, 2);
+        selection.ExtendSelection(1, 1);
+        var snapshot = selection.CaptureForResize(buffer, scrollOffset: -1);
+
+        buffer.Resize(10, 2);
+
+        selection.RestoreAfterResize(buffer, snapshot!.Value, scrollOffset: 0).Should().BeTrue();
+        selection.Start.Should().Be(new SelectionPoint(0, 2));
+        selection.End.Should().Be(new SelectionPoint(0, 6));
+        selection.GetSelectedText(buffer).Should().Be("cdefg");
+    }
+
+    [Fact]
+    public void RestoreAfterResize_PreservesSelectionAcrossHardLineBreaks()
+    {
+        var buffer = new TerminalBuffer(5, 3);
+        buffer.WriteString("abc");
+        buffer.NewLine();
+        buffer.WriteString("def");
+
+        var selection = new TerminalSelection();
+        selection.StartSelection(0, 1);
+        selection.ExtendSelection(1, 2);
+        var snapshot = selection.CaptureForResize(buffer);
+
+        buffer.Resize(10, 3);
+
+        selection.RestoreAfterResize(buffer, snapshot!.Value).Should().BeTrue();
+        selection.Start.Should().Be(new SelectionPoint(0, 1));
+        selection.End.Should().Be(new SelectionPoint(1, 2));
+        selection.GetSelectedText(buffer).Should().Be($"bc{Environment.NewLine}def");
+    }
+
+    [Fact]
     public void IsSelected_MultiLine_Works()
     {
         var selection = new TerminalSelection();
@@ -580,6 +802,188 @@ public class TerminalModeTests
         var buffer = new TerminalBuffer(80, 24);
         buffer.BracketedPasteMode = true;
         buffer.BracketedPasteMode.Should().BeTrue();
+    }
+
+    [Fact]
+    public void KeyboardModeFlags_DefaultToExpectedValues()
+    {
+        var buffer = new TerminalBuffer(80, 24);
+
+        buffer.ApplicationKeypad.Should().BeFalse();
+        buffer.AutoNewlineMode.Should().BeFalse();
+        buffer.FocusEventMode.Should().BeFalse();
+        buffer.AltSendsEscape.Should().BeTrue();
+        buffer.MetaSendsEscape.Should().BeTrue();
+        buffer.MouseAlternateScroll.Should().BeFalse();
+    }
+}
+
+public class TerminalSessionModeTests
+{
+    [Fact]
+    public void Feed_EscDeckpamAndDeckpnm_TogglesApplicationKeypad()
+    {
+        using var session = new TerminalSession("test");
+
+        session.FeedOutput(Encoding.UTF8.GetBytes("\x1b="));
+        session.Buffer.ApplicationKeypad.Should().BeTrue();
+
+        session.FeedOutput(Encoding.UTF8.GetBytes("\x1b>"));
+        session.Buffer.ApplicationKeypad.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Feed_PrivateKeyboardModes_TogglesBufferFlags()
+    {
+        using var session = new TerminalSession("test");
+
+        session.FeedOutput(Encoding.UTF8.GetBytes("\x1b[?66;1004;1007;1036;1039h"));
+
+        session.Buffer.ApplicationKeypad.Should().BeTrue();
+        session.Buffer.FocusEventMode.Should().BeTrue();
+        session.Buffer.MouseAlternateScroll.Should().BeTrue();
+        session.Buffer.MetaSendsEscape.Should().BeTrue();
+        session.Buffer.AltSendsEscape.Should().BeTrue();
+
+        session.FeedOutput(Encoding.UTF8.GetBytes("\x1b[?66;1004;1007;1036;1039l"));
+
+        session.Buffer.ApplicationKeypad.Should().BeFalse();
+        session.Buffer.FocusEventMode.Should().BeFalse();
+        session.Buffer.MouseAlternateScroll.Should().BeFalse();
+        session.Buffer.MetaSendsEscape.Should().BeFalse();
+        session.Buffer.AltSendsEscape.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Feed_LineFeedNewLineMode_TogglesAutoNewlineMode()
+    {
+        using var session = new TerminalSession("test");
+
+        session.FeedOutput(Encoding.UTF8.GetBytes("\x1b[20h"));
+        session.Buffer.AutoNewlineMode.Should().BeTrue();
+
+        session.FeedOutput(Encoding.UTF8.GetBytes("\x1b[20l"));
+        session.Buffer.AutoNewlineMode.Should().BeFalse();
+    }
+
+    [Fact]
+    public void Feed_Private1048_RestoresSavedCursor()
+    {
+        using var session = new TerminalSession("test");
+        session.Buffer.MoveCursorTo(2, 3);
+
+        session.FeedOutput(Encoding.UTF8.GetBytes("\x1b[?1048h"));
+        session.Buffer.MoveCursorTo(0, 0);
+        session.FeedOutput(Encoding.UTF8.GetBytes("\x1b[?1048l"));
+
+        session.Buffer.CursorRow.Should().Be(2);
+        session.Buffer.CursorCol.Should().Be(3);
+    }
+}
+
+public class TerminalKeyEncoderTests
+{
+    [Fact]
+    public void Encode_ArrowKey_UsesAnsiCursorByDefault()
+    {
+        var sequence = TerminalKeyEncoder.Encode(TerminalKey.Left);
+
+        sequence.Should().Be("\x1b[D");
+    }
+
+    [Fact]
+    public void Encode_ArrowKey_UsesApplicationCursorWhenEnabled()
+    {
+        var sequence = TerminalKeyEncoder.Encode(
+            TerminalKey.Left,
+            options: new TerminalKeyEncodingOptions(ApplicationCursorKeys: true));
+
+        sequence.Should().Be("\x1bOD");
+    }
+
+    [Theory]
+    [InlineData(TerminalKey.Left, TerminalKeyModifiers.Control, "\x1b[1;5D")]
+    [InlineData(TerminalKey.Right, TerminalKeyModifiers.Alt, "\x1b[1;3C")]
+    [InlineData(TerminalKey.Up, TerminalKeyModifiers.Shift, "\x1b[1;2A")]
+    [InlineData(TerminalKey.Down, TerminalKeyModifiers.Control | TerminalKeyModifiers.Alt, "\x1b[1;7B")]
+    public void Encode_CursorKeyWithModifiers_UsesXtermModifierEncoding(
+        TerminalKey key,
+        TerminalKeyModifiers modifiers,
+        string expected)
+    {
+        var sequence = TerminalKeyEncoder.Encode(key, modifiers);
+
+        sequence.Should().Be(expected);
+    }
+
+    [Fact]
+    public void Encode_ApplicationCursorWithModifier_ConvertsSs3ToCsi()
+    {
+        var sequence = TerminalKeyEncoder.Encode(
+            TerminalKey.Left,
+            TerminalKeyModifiers.Control,
+            new TerminalKeyEncodingOptions(ApplicationCursorKeys: true));
+
+        sequence.Should().Be("\x1b[1;5D");
+    }
+
+    [Theory]
+    [InlineData(TerminalKey.F1, TerminalKeyModifiers.Shift, "\x1b[1;2P")]
+    [InlineData(TerminalKey.F5, TerminalKeyModifiers.Control, "\x1b[15;5~")]
+    [InlineData(TerminalKey.Delete, TerminalKeyModifiers.Alt, "\x1b[3;3~")]
+    public void Encode_FunctionKeyWithModifiers_UsesXtermModifierEncoding(
+        TerminalKey key,
+        TerminalKeyModifiers modifiers,
+        string expected)
+    {
+        var sequence = TerminalKeyEncoder.Encode(key, modifiers);
+
+        sequence.Should().Be(expected);
+    }
+
+    [Fact]
+    public void Encode_ShiftTab_ReturnsReverseTab()
+    {
+        var sequence = TerminalKeyEncoder.Encode(TerminalKey.Tab, TerminalKeyModifiers.Shift);
+
+        sequence.Should().Be("\x1b[Z");
+    }
+
+    [Fact]
+    public void TryEncodeControlLetter_ReturnsControlByte()
+    {
+        var encoded = TerminalKeyEncoder.TryEncodeControlLetter('x', out var sequence);
+
+        encoded.Should().BeTrue();
+        sequence.Should().Be("\x18");
+    }
+
+    [Fact]
+    public void Encode_Keypad_UsesNumericModeByDefault()
+    {
+        TerminalKeyEncoder.Encode(TerminalKey.Keypad1).Should().Be("1");
+        TerminalKeyEncoder.Encode(TerminalKey.KeypadAdd).Should().Be("+");
+        TerminalKeyEncoder.Encode(TerminalKey.KeypadEnter).Should().Be("\r");
+    }
+
+    [Fact]
+    public void Encode_Keypad_UsesApplicationModeWhenEnabled()
+    {
+        var options = new TerminalKeyEncodingOptions(ApplicationKeypad: true);
+
+        TerminalKeyEncoder.Encode(TerminalKey.Keypad1, options: options).Should().Be("\x1bOq");
+        TerminalKeyEncoder.Encode(TerminalKey.KeypadAdd, options: options).Should().Be("\x1bOk");
+        TerminalKeyEncoder.Encode(TerminalKey.KeypadEnter, options: options).Should().Be("\x1bOM");
+    }
+
+    [Fact]
+    public void Encode_Enter_UsesAutoNewlineWhenEnabled()
+    {
+        var sequence = TerminalKeyEncoder.Encode(
+            TerminalKey.Enter,
+            options: new TerminalKeyEncodingOptions(AutoNewline: true));
+
+        sequence.Should().Be("\r\n");
     }
 }
 

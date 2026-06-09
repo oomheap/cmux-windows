@@ -109,9 +109,16 @@ public sealed class TerminalSession : IDisposable
                     break;
                 case 'c': // RIS — Full Reset
                     Buffer.Clear();
+                    Buffer.ResetModes();
                     Buffer.CurrentAttribute = TerminalAttribute.Default;
                     Buffer.ResetScrollRegion();
                     Buffer.MoveCursorTo(0, 0);
+                    break;
+                case '=': // DECKPAM -- Application Keypad
+                    Buffer.ApplicationKeypad = true;
+                    break;
+                case '>': // DECKPNM -- Numeric Keypad
+                    Buffer.ApplicationKeypad = false;
                     break;
             }
         };
@@ -579,6 +586,9 @@ public sealed class TerminalSession : IDisposable
                     case 1: // DECCKM -- Cursor Keys Mode
                         Buffer.ApplicationCursorKeys = set;
                         break;
+                    case 66: // DECNKM -- Numeric/Application Keypad
+                        Buffer.ApplicationKeypad = set;
+                        break;
                     case 6: // DECOM — Origin Mode
                         Buffer.OriginMode = set;
                         break;
@@ -605,6 +615,12 @@ public sealed class TerminalSession : IDisposable
                         else
                             Buffer.SwitchToMainScreen();
                         break;
+                    case 1048: // Save/restore cursor
+                        if (set)
+                            Buffer.SaveCursor();
+                        else
+                            Buffer.RestoreCursor();
+                        break;
                     case 2004: // Bracketed paste mode
                         Buffer.BracketedPasteMode = set;
                         break;
@@ -617,8 +633,21 @@ public sealed class TerminalSession : IDisposable
                     case 1003: // Any-event mouse tracking
                         Buffer.MouseTrackingAny = set;
                         break;
+                    case 1004: // FocusIn/FocusOut event reporting
+                        Buffer.FocusEventMode = set;
+                        break;
                     case 1006: // SGR extended mouse reporting
                         Buffer.MouseSgrExtended = set;
+                        break;
+                    case 1007: // Alternate scroll mode
+                        Buffer.MouseAlternateScroll = set;
+                        break;
+                    case 1034: // Interpret meta key
+                    case 1036: // Meta sends ESC
+                        Buffer.MetaSendsEscape = set;
+                        break;
+                    case 1039: // Alt sends ESC
+                        Buffer.AltSendsEscape = set;
                         break;
                 }
             }
@@ -628,6 +657,9 @@ public sealed class TerminalSession : IDisposable
                 {
                     case 4: // IRM — Insert/Replace Mode
                         Buffer.InsertMode = set;
+                        break;
+                    case 20: // LNM -- Line Feed/New Line Mode
+                        Buffer.AutoNewlineMode = set;
                         break;
                 }
             }

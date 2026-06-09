@@ -14,6 +14,30 @@ public struct SelectionPoint
     }
 }
 
+public readonly struct TerminalTextAnchor
+{
+    public TerminalTextAnchor(int logicalLine, int displayOffset)
+    {
+        LogicalLine = Math.Max(0, logicalLine);
+        DisplayOffset = Math.Max(0, displayOffset);
+    }
+
+    public int LogicalLine { get; }
+    public int DisplayOffset { get; }
+}
+
+public readonly struct TerminalSelectionSnapshot
+{
+    public TerminalSelectionSnapshot(TerminalTextAnchor start, TerminalTextAnchor end)
+    {
+        Start = start;
+        End = end;
+    }
+
+    public TerminalTextAnchor Start { get; }
+    public TerminalTextAnchor End { get; }
+}
+
 /// <summary>
 /// Manages text selection in the terminal buffer.
 /// Supports click-to-start, drag-to-extend, double-click word select,
@@ -49,6 +73,34 @@ public class TerminalSelection
         _start = null;
         _end = null;
         SelectionChanged?.Invoke();
+    }
+
+    public TerminalSelectionSnapshot? CaptureForResize(TerminalBuffer buffer, int scrollOffset = 0)
+    {
+        if (!_start.HasValue || !_end.HasValue)
+            return null;
+
+        return new TerminalSelectionSnapshot(
+            buffer.CreateTextAnchor(_start.Value.Row, _start.Value.Col, scrollOffset),
+            buffer.CreateTextAnchor(_end.Value.Row, _end.Value.Col, scrollOffset));
+    }
+
+    public bool RestoreAfterResize(
+        TerminalBuffer buffer,
+        TerminalSelectionSnapshot snapshot,
+        int scrollOffset = 0)
+    {
+        if (!buffer.TryResolveTextAnchor(snapshot.Start, scrollOffset, out var start) ||
+            !buffer.TryResolveTextAnchor(snapshot.End, scrollOffset, out var end))
+        {
+            ClearSelection();
+            return false;
+        }
+
+        _start = start;
+        _end = end;
+        SelectionChanged?.Invoke();
+        return true;
     }
 
     /// <summary>
@@ -109,20 +161,25 @@ public class TerminalSelection
 
             for (int col = startCol; col <= endCol && col < buffer.Cols; col++)
             {
-                char ch;
+                TerminalCell cell;
                 if (isScrollback)
                 {
                     var line = buffer.GetScrollbackLine(virtualLine);
-                    ch = (line != null && col < line.Length) ? line[col].Character : '\0';
+                    cell = (line != null && col < line.Length) ? line[col] : TerminalCell.Empty;
                 }
                 else if (bufferRow >= 0 && bufferRow < buffer.Rows)
                 {
-                    ch = buffer.CellAt(bufferRow, col).Character;
+                    cell = buffer.CellAt(bufferRow, col);
                 }
                 else
                 {
-                    ch = '\0';
+                    cell = TerminalCell.Empty;
                 }
+
+                if (cell.Width == 0)
+                    continue;
+
+                var ch = cell.Character;
                 sb.Append(ch == '\0' ? ' ' : ch);
             }
 
@@ -153,14 +210,22 @@ public class TerminalSelection
 
         char GetChar(int c)
         {
+            TerminalCell cell;
             if (isScrollback)
             {
                 var line = buffer.GetScrollbackLine(virtualLine);
-                return (line != null && c < line.Length) ? line[c].Character : '\0';
+                cell = (line != null && c < line.Length) ? line[c] : TerminalCell.Empty;
             }
-            if (bufferRow >= 0 && bufferRow < buffer.Rows)
-                return buffer.CellAt(bufferRow, c).Character;
-            return '\0';
+            else if (bufferRow >= 0 && bufferRow < buffer.Rows)
+            {
+                cell = buffer.CellAt(bufferRow, c);
+            }
+            else
+            {
+                cell = TerminalCell.Empty;
+            }
+
+            return cell.Width == 0 ? '\0' : cell.Character;
         }
 
         bool IsWordChar(char ch) => ch != '\0' && ch != ' ' && (char.IsLetterOrDigit(ch) || ch == '_' || ch == '-');

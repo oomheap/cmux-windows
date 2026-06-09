@@ -220,17 +220,11 @@ public static class NamedPipeClient
         using var reader = new StreamReader(pipe, Encoding.UTF8, leaveOpen: true);
         using var writer = new StreamWriter(pipe, Encoding.UTF8, leaveOpen: true) { AutoFlush = true };
 
-        var sb = new StringBuilder(command);
-        if (args != null)
-        {
-            foreach (var kvp in args)
-            {
-                var value = kvp.Value.Contains(' ') ? $"\"{kvp.Value}\"" : kvp.Value;
-                sb.Append($" {kvp.Key}={value}");
-            }
-        }
+        var request = command;
+        if (args is { Count: > 0 })
+            request += " " + JsonSerializer.Serialize(args);
 
-        await writer.WriteLineAsync(sb.ToString());
+        await writer.WriteLineAsync(request);
 
         var response = await reader.ReadLineAsync(cts.Token);
         return response ?? "";

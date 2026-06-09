@@ -4,18 +4,8 @@ using Cmux.Core.IPC;
 namespace Cmux.Cli;
 
 /// <summary>
-/// cmux CLI tool — Windows equivalent of the cmux macOS CLI.
+/// cmux CLI tool, Windows equivalent of the cmux macOS CLI.
 /// Communicates with the running cmux app via named pipes.
-///
-/// Usage:
-///   cmux notify --title "Title" --body "Body"
-///   cmux workspace list
-///   cmux workspace create --name "My Workspace"
-///   cmux workspace select --index 0
-///   cmux surface create
-///   cmux split right
-///   cmux split down
-///   cmux status
 /// </summary>
 public static class Program
 {
@@ -35,8 +25,13 @@ public static class Program
             {
                 "notify" => await HandleNotify(args[1..]),
                 "workspace" => await HandleWorkspace(args[1..]),
-                "surface" => await HandleSurface(args[1..]),
+                "surface" or "tab" => await HandleSurface(args[1..]),
                 "split" => await HandleSplit(args[1..]),
+                "pane" => await HandlePane(args[1..]),
+                "send" or "send-keys" => await HandleSendKeys(args[1..], submitByDefault: false),
+                "run" => await HandleSendKeys(args[1..], submitByDefault: true),
+                "capture-pane" => await HandleCapturePane(args[1..]),
+                "restore" or "restore-session" => await SendAndPrint("RESTORE_SESSION"),
                 "status" => await HandleStatus(),
                 "help" or "--help" or "-h" => PrintHelp(),
                 "version" or "--version" or "-v" => PrintVersion(),
@@ -67,18 +62,17 @@ public static class Program
             ["title"] = title,
             ["body"] = body,
         };
-        if (subtitle != null) cmdArgs["subtitle"] = subtitle;
+        if (subtitle != null)
+            cmdArgs["subtitle"] = subtitle;
 
-        var response = await NamedPipeClient.SendCommand("NOTIFY", cmdArgs);
-        Console.WriteLine(response);
-        return 0;
+        return await SendAndPrint("NOTIFY", cmdArgs);
     }
 
     private static async Task<int> HandleWorkspace(string[] args)
     {
         if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: cmux workspace <list|create|select>");
+            Console.Error.WriteLine("Usage: cmux workspace <list|create|select|next|previous>");
             return 1;
         }
 
@@ -100,15 +94,17 @@ public static class Program
     {
         if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: cmux surface <create>");
+            Console.Error.WriteLine("Usage: cmux surface <create|select|next|previous>");
             return 1;
         }
 
         var subcommand = args[0].ToLowerInvariant();
+        var parsed = NormalizeSurfaceArgs(ParseArgs(args[1..]));
 
         return subcommand switch
         {
-            "create" or "new" => await SendAndPrint("SURFACE.CREATE"),
+            "create" or "new" => await SendAndPrint("SURFACE.CREATE", parsed),
+            "select" => await SendAndPrint("SURFACE.SELECT", parsed),
             "next" => await SendAndPrint("SURFACE.NEXT"),
             "previous" or "prev" => await SendAndPrint("SURFACE.PREVIOUS"),
             _ => Error($"Unknown surface command: {subcommand}"),
@@ -133,19 +129,80 @@ public static class Program
         };
     }
 
+    private static async Task<int> HandlePane(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            Console.Error.WriteLine("Usage: cmux pane <list|focus|write|read>");
+            return 1;
+        }
+
+        var subcommand = args[0].ToLowerInvariant();
+        var parsed = NormalizePaneArgs(ParseArgs(args[1..]));
+
+        return subcommand switch
+        {
+            "list" or "ls" => await SendAndPrint("PANE.LIST", parsed),
+            "focus" or "select" => await SendAndPrint("PANE.FOCUS", parsed),
+            "write" or "send" => await SendPaneWrite(parsed),
+            "read" or "capture" => await SendAndPrint("PANE.READ", parsed),
+            _ => Error($"Unknown pane command: {subcommand}"),
+        };
+    }
+
+    private static async Task<int> HandleSendKeys(string[] args, bool submitByDefault)
+    {
+        var parsed = NormalizePaneArgs(ParseArgs(args));
+        if (submitByDefault)
+            parsed["submit"] = "true";
+
+        if (parsed.Remove("enter"))
+            parsed["submit"] = "true";
+
+        return await SendPaneWrite(parsed);
+    }
+
+    private static async Task<int> HandleCapturePane(string[] args)
+    {
+        var parsed = NormalizePaneArgs(ParseArgs(args));
+        return await SendAndPrint("PANE.READ", parsed);
+    }
+
     private static async Task<int> HandleStatus()
     {
         return await SendAndPrint("STATUS");
+    }
+
+    private static async Task<int> SendPaneWrite(Dictionary<string, string> parsed)
+    {
+        var text = ExtractText(parsed);
+        if (text != null)
+            parsed["text"] = text;
+
+        var hasSubmit = parsed.TryGetValue("submit", out var submitRaw)
+            && bool.TryParse(submitRaw, out var submit)
+            && submit;
+
+        if (!hasSubmit && !parsed.ContainsKey("text"))
+            return Error("Missing text. Use cmux send-keys \"text\" or cmux run \"command\".");
+
+        return await SendAndPrint("PANE.WRITE", parsed);
     }
 
     private static async Task<int> SendAndPrint(string command, Dictionary<string, string>? args = null)
     {
         var response = await NamedPipeClient.SendCommand(command, args);
 
-        // Pretty-print JSON
         try
         {
             using var doc = JsonDocument.Parse(response);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                doc.RootElement.TryGetProperty("error", out var error))
+            {
+                Console.Error.WriteLine(error.GetString() ?? "Unknown error");
+                return 1;
+            }
+
             var pretty = JsonSerializer.Serialize(doc, new JsonSerializerOptions { WriteIndented = true });
             Console.WriteLine(pretty);
         }
@@ -157,6 +214,60 @@ public static class Program
         return 0;
     }
 
+    private static Dictionary<string, string> NormalizeSurfaceArgs(Dictionary<string, string> args)
+    {
+        CopyAlias(args, "id", "surfaceId");
+        CopyAlias(args, "name", "surfaceName");
+        CopyAlias(args, "index", "surfaceIndex");
+        CopyAlias(args, "workspace", "workspaceName");
+        CopyAlias(args, "workspace-id", "workspaceId");
+        CopyAlias(args, "workspace-index", "workspaceIndex");
+        return args;
+    }
+
+    private static Dictionary<string, string> NormalizePaneArgs(Dictionary<string, string> args)
+    {
+        CopyAlias(args, "workspace", "workspaceName");
+        CopyAlias(args, "workspace-id", "workspaceId");
+        CopyAlias(args, "workspace-index", "workspaceIndex");
+        CopyAlias(args, "surface", "surfaceName");
+        CopyAlias(args, "tab", "surfaceName");
+        CopyAlias(args, "surface-id", "surfaceId");
+        CopyAlias(args, "surface-index", "surfaceIndex");
+        CopyAlias(args, "pane", "paneName");
+        CopyAlias(args, "pane-id", "paneId");
+        CopyAlias(args, "id", "paneId");
+        CopyAlias(args, "index", "paneIndex");
+        CopyAlias(args, "pane-index", "paneIndex");
+        return args;
+    }
+
+    private static void CopyAlias(Dictionary<string, string> args, string from, string to)
+    {
+        if (!args.ContainsKey(to) && args.TryGetValue(from, out var value))
+            args[to] = value;
+    }
+
+    private static string? ExtractText(Dictionary<string, string> args)
+    {
+        if (args.TryGetValue("text", out var explicitText))
+            return explicitText;
+
+        var positional = args
+            .Where(kvp => kvp.Key.StartsWith("_arg", StringComparison.Ordinal))
+            .Select(kvp => new
+            {
+                Index = int.TryParse(kvp.Key[4..], out var index) ? index : int.MaxValue,
+                kvp.Value,
+            })
+            .OrderBy(item => item.Index)
+            .Select(item => item.Value)
+            .Where(value => !string.IsNullOrEmpty(value))
+            .ToList();
+
+        return positional.Count == 0 ? null : string.Join(" ", positional);
+    }
+
     private static Dictionary<string, string> ParseArgs(string[] args)
     {
         var result = new Dictionary<string, string>();
@@ -166,10 +277,10 @@ public static class Program
         {
             var arg = args[i];
 
-            if (arg.StartsWith("--"))
+            if (arg.StartsWith("--", StringComparison.Ordinal))
             {
                 var key = arg[2..];
-                if (i + 1 < args.Length && !args[i + 1].StartsWith("--"))
+                if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
                 {
                     result[key] = args[i + 1];
                     i++;
@@ -179,10 +290,10 @@ public static class Program
                     result[key] = "true";
                 }
             }
-            else if (arg.StartsWith('-') && arg.Length == 2)
+            else if (arg.StartsWith('-', StringComparison.Ordinal) && arg.Length == 2)
             {
                 var key = arg[1..];
-                if (i + 1 < args.Length && !args[i + 1].StartsWith('-'))
+                if (i + 1 < args.Length && !args[i + 1].StartsWith('-', StringComparison.Ordinal))
                 {
                     result[key] = args[i + 1];
                     i++;
@@ -220,14 +331,20 @@ public static class Program
                 list                List all workspaces
                 create              Create a new workspace
                   --name <text>     Workspace name
+                  --cwd <path>      Workspace working directory
                 select              Select a workspace
-                  --index <n>       Workspace index (0-based)
+                  --index <n>       Workspace index (0-based or 1-based)
                   --id <id>         Workspace ID
+                  --name <text>     Workspace name
                 next                Switch to next workspace
                 previous            Switch to previous workspace
 
-              surface               Manage surfaces (tabs within workspace)
+              surface, tab          Manage surfaces (tabs within workspace)
                 create              Create a new surface
+                select              Select a surface
+                  --index <n>       Surface index (0-based or 1-based)
+                  --id <id>         Surface ID
+                  --name <text>     Surface name
                 next                Switch to next surface
                 previous            Switch to previous surface
 
@@ -235,6 +352,22 @@ public static class Program
                 right               Split vertically (left/right)
                 down                Split horizontally (top/bottom)
 
+              pane                  Manage panes
+                list                List panes in the selected surface
+                focus               Focus a pane
+                  --index <n>       Pane index (0-based or 1-based)
+                  --id <id>         Pane ID
+                  --name <text>     Pane name
+                write <text>        Write text to a pane
+                  --enter           Submit with Enter after writing
+                read                Print terminal text from a pane
+                  --lines <n>       Number of tail lines to read
+
+              send-keys <text>      Write text to the focused pane
+                --enter             Submit with Enter after writing
+              run <command>         Write a command and submit it
+              capture-pane          Alias for pane read
+              restore-session       Reload the saved workspace/session layout
               status                Show cmux status
 
             Keyboard Shortcuts (in the app):

@@ -313,10 +313,47 @@ public class TerminalControl : FrameworkElement
 
         if (cols != _cols || rows != _rows)
         {
+            var session = _session;
+            var selectionSnapshot = session != null
+                ? _selection.CaptureForResize(session.Buffer, _scrollOffset)
+                : null;
+
             _cols = cols;
             _rows = rows;
-            _session?.Resize(cols, rows);
+            session?.Resize(cols, rows);
+
+            if (session != null && selectionSnapshot.HasValue)
+            {
+                _scrollOffset = ResolveScrollOffsetForSelection(session.Buffer, selectionSnapshot.Value, _scrollOffset);
+                _selection.RestoreAfterResize(session.Buffer, selectionSnapshot.Value, _scrollOffset);
+                _lastScrollbackCount = session.Buffer.ScrollbackCount;
+            }
         }
+    }
+
+    private int ResolveScrollOffsetForSelection(
+        TerminalBuffer buffer,
+        TerminalSelectionSnapshot snapshot,
+        int currentScrollOffset)
+    {
+        if (_rows <= 0 ||
+            !buffer.TryResolveTextAnchorAbsolute(snapshot.Start, out var startRow, out _) ||
+            !buffer.TryResolveTextAnchorAbsolute(snapshot.End, out var endRow, out _))
+        {
+            return Math.Clamp(currentScrollOffset, -buffer.ScrollbackCount, 0);
+        }
+
+        var minRow = Math.Min(startRow, endRow);
+        var maxRow = Math.Max(startRow, endRow);
+        var viewStart = buffer.ScrollbackCount + currentScrollOffset;
+        var viewEnd = viewStart + _rows - 1;
+
+        if (minRow < viewStart)
+            viewStart = minRow;
+        else if (maxRow > viewEnd)
+            viewStart = maxRow - _rows + 1;
+
+        return Math.Clamp(viewStart - buffer.ScrollbackCount, -buffer.ScrollbackCount, 0);
     }
 
     protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
@@ -324,6 +361,26 @@ public class TerminalControl : FrameworkElement
         base.OnRenderSizeChanged(sizeInfo);
         CalculateTerminalSize();
         RequestRender(System.Windows.Threading.DispatcherPriority.Render);
+    }
+
+    protected override void OnGotKeyboardFocus(KeyboardFocusChangedEventArgs e)
+    {
+        base.OnGotKeyboardFocus(e);
+        SendFocusReport(focused: true);
+    }
+
+    protected override void OnLostKeyboardFocus(KeyboardFocusChangedEventArgs e)
+    {
+        base.OnLostKeyboardFocus(e);
+        SendFocusReport(focused: false);
+    }
+
+    private void SendFocusReport(bool focused)
+    {
+        if (_session?.Buffer.FocusEventMode != true)
+            return;
+
+        _session.Write(focused ? "\x1b[I" : "\x1b[O");
     }
 
     // --- Rendering ---
@@ -421,6 +478,7 @@ public class TerminalControl : FrameworkElement
                 Color runFgColor = default;
                 bool runBold = false, runItalic = false, runDim = false;
                 bool runUnderline = false, runStrikethrough = false;
+                int runCellWidth = 0;
                 _textRunBuffer.Clear();
 
                 for (int c = 0; c < _cols; c++)
@@ -501,8 +559,9 @@ public class TerminalControl : FrameworkElement
                             italic != runItalic || dim != runDim ||
                             underline != runUnderline || strikethrough != runStrikethrough))
                         {
-                            FlushTextRun(dc, dpi, y, runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
+                            FlushTextRun(dc, dpi, y, runStartCol, runCellWidth, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
                             runStartCol = -1;
+                            runCellWidth = 0;
                         }
 
                         // Start new run or continue existing
@@ -515,22 +574,24 @@ public class TerminalControl : FrameworkElement
                             runDim = dim;
                             runUnderline = underline;
                             runStrikethrough = strikethrough;
+                            runCellWidth = 0;
                             _textRunBuffer.Clear();
                         }
 
                         _textRunBuffer.Append(cell.Character);
+                        runCellWidth += Math.Max(1, cell.Width);
                     }
                     else if (runStartCol >= 0)
                     {
                         // Empty cell — flush the current run
-                        FlushTextRun(dc, dpi, y, runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
+                        FlushTextRun(dc, dpi, y, runStartCol, runCellWidth, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
                         runStartCol = -1;
                     }
                 }
 
                 // Flush final run for this row
                 if (runStartCol >= 0)
-                    FlushTextRun(dc, dpi, y, runStartCol, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
+                    FlushTextRun(dc, dpi, y, runStartCol, runCellWidth, runFgColor, runBold, runItalic, runDim, runUnderline, runStrikethrough);
             }
 
             // Cursor (only when viewing live buffer)
@@ -588,7 +649,7 @@ public class TerminalControl : FrameworkElement
     /// <summary>
     /// Draws a batched text run and its decorations (underline/strikethrough).
     /// </summary>
-    private void FlushTextRun(DrawingContext dc, double dpi, double y, int startCol,
+    private void FlushTextRun(DrawingContext dc, double dpi, double y, int startCol, int cellWidth,
         Color fgColor, bool bold, bool italic, bool dim, bool underline, bool strikethrough)
     {
         if (_textRunBuffer.Length == 0) return;
@@ -609,7 +670,7 @@ public class TerminalControl : FrameworkElement
         double x = startCol * _cellWidth;
         dc.DrawText(text, new Point(x, y));
 
-        double runWidth = _textRunBuffer.Length * _cellWidth;
+        double runWidth = Math.Max(_textRunBuffer.Length, cellWidth) * _cellWidth;
 
         if (underline)
         {
@@ -770,6 +831,7 @@ public class TerminalControl : FrameworkElement
     {
         if (_session == null) return;
 
+        var key = GetEffectiveKey(e);
         var modifiers = Keyboard.Modifiers;
         bool ctrl = modifiers.HasFlag(ModifierKeys.Control);
         bool shift = modifiers.HasFlag(ModifierKeys.Shift);
@@ -780,10 +842,10 @@ public class TerminalControl : FrameworkElement
         // and Ctrl+Shift combos (split, zoom, search, etc.) are app-level.
         if (ctrl && alt) return;
         if (ctrl && shift) return;
-        if (ctrl && e.Key == Key.Tab) return;
+        if (ctrl && key == Key.Tab) return;
 
         // Ctrl+Backspace: delete previous word (send Ctrl+W / unix-word-rubout)
-        if (ctrl && e.Key == Key.Back)
+        if (ctrl && key == Key.Back)
         {
             _inputLineBuffer.Clear();
             EnsureLiveView();
@@ -793,7 +855,7 @@ public class TerminalControl : FrameworkElement
         }
 
         // Terminal shortcuts
-        if (ctrl && e.Key == Key.C)
+        if (ctrl && key == Key.C)
         {
             if (!CopySelectionToClipboard())
             {
@@ -807,14 +869,14 @@ public class TerminalControl : FrameworkElement
             return;
         }
 
-        if ((ctrl && e.Key == Key.V) || (shift && e.Key == Key.Insert))
+        if ((ctrl && key == Key.V) || (shift && key == Key.Insert))
         {
             PasteFromClipboard();
             e.Handled = true;
             return;
         }
 
-        if (ctrl && e.Key == Key.Insert)
+        if (ctrl && key == Key.Insert)
         {
             _ = CopySelectionToClipboard();
             e.Handled = true;
@@ -822,7 +884,7 @@ public class TerminalControl : FrameworkElement
         }
 
         // Forward Ctrl+letter as control bytes (e.g. Ctrl+X => 0x18) for TUI apps like nano.
-        if (ctrl && !modifiers.HasFlag(ModifierKeys.Alt) && TryGetCtrlLetterSequence(e.Key, out var ctrlSequence))
+        if (ctrl && !modifiers.HasFlag(ModifierKeys.Alt) && TryGetCtrlLetterSequence(key, out var ctrlSequence))
         {
             _inputLineBuffer.Clear();
             EnsureLiveView();
@@ -831,13 +893,21 @@ public class TerminalControl : FrameworkElement
             return;
         }
 
-        bool appCursor = _session.Buffer.ApplicationCursorKeys;
-        string? sequence = KeyToVtSequence(e.Key, modifiers, appCursor);
+        string? sequence = TryMapTerminalKey(key, out var terminalKey)
+            ? TerminalKeyEncoder.Encode(
+                terminalKey,
+                ToTerminalKeyModifiers(modifiers),
+                new TerminalKeyEncodingOptions(
+                    ApplicationCursorKeys: _session.Buffer.ApplicationCursorKeys,
+                    ApplicationKeypad: _session.Buffer.ApplicationKeypad,
+                    AutoNewline: _session.Buffer.AutoNewlineMode))
+            : null;
+
         if (sequence != null)
         {
-            if (e.Key == Key.Back)
+            if (key == Key.Back)
                 TrackInputText("\b");
-            else if (e.Key == Key.Enter)
+            else if (key == Key.Enter)
             {
                 SubmitBufferedCommand(allowInterception: true);
                 if (_suppressNextEnterToShell)
@@ -896,8 +966,22 @@ public class TerminalControl : FrameworkElement
 
         EnsureLiveView();
         TrackInputText(e.Text);
-        _session.Write(e.Text);
+        _session.Write(ApplyTextInputModifiers(e.Text, Keyboard.Modifiers, _session.Buffer));
         _selection.ClearSelection();
+    }
+
+    private static string ApplyTextInputModifiers(string text, ModifierKeys modifiers, TerminalBuffer buffer)
+    {
+        if (string.IsNullOrEmpty(text))
+            return text;
+
+        var shouldPrefixEscape =
+            (modifiers.HasFlag(ModifierKeys.Alt) && buffer.AltSendsEscape) ||
+            (modifiers.HasFlag(ModifierKeys.Windows) && buffer.MetaSendsEscape);
+
+        return shouldPrefixEscape && text[0] != '\x1b'
+            ? "\x1b" + text
+            : text;
     }
 
     private void PasteFromClipboard()
@@ -1466,6 +1550,24 @@ public class TerminalControl : FrameworkElement
             return;
         }
 
+        if (_session.Buffer is { IsAlternateScreen: true, MouseAlternateScroll: true })
+        {
+            var key = e.Delta > 0 ? TerminalKey.Up : TerminalKey.Down;
+            var sequence = TerminalKeyEncoder.Encode(
+                key,
+                options: new TerminalKeyEncodingOptions(
+                    ApplicationCursorKeys: _session.Buffer.ApplicationCursorKeys,
+                    ApplicationKeypad: _session.Buffer.ApplicationKeypad,
+                    AutoNewline: _session.Buffer.AutoNewlineMode));
+            if (sequence != null)
+            {
+                EnsureLiveView();
+                _session.Write(sequence);
+                e.Handled = true;
+                return;
+            }
+        }
+
         // Scrollback navigation
         int lines = e.Delta > 0 ? -3 : 3;
         _scrollOffset = Math.Clamp(_scrollOffset + lines, -_session.Buffer.ScrollbackCount, 0);
@@ -1480,64 +1582,117 @@ public class TerminalControl : FrameworkElement
     protected override int VisualChildrenCount => 1;
     protected override Visual GetVisualChild(int index) => _visual;
 
-    private static bool TryGetCtrlLetterSequence(Key key, out string sequence)
+    private static Key GetEffectiveKey(KeyEventArgs e)
     {
-        sequence = "";
-        if (key < Key.A || key > Key.Z)
-            return false;
-
-        var controlCode = (char)(key - Key.A + 1);
-        sequence = controlCode.ToString();
-        return true;
+        return e.Key switch
+        {
+            Key.System => e.SystemKey,
+            Key.ImeProcessed => e.ImeProcessedKey,
+            _ => e.Key,
+        };
     }
 
-    private static string? KeyToVtSequence(Key key, ModifierKeys modifiers, bool appCursor)
+    private static TerminalKeyModifiers ToTerminalKeyModifiers(ModifierKeys modifiers)
     {
-        if (appCursor)
+        var terminalModifiers = TerminalKeyModifiers.None;
+
+        if (modifiers.HasFlag(ModifierKeys.Shift))
+            terminalModifiers |= TerminalKeyModifiers.Shift;
+        if (modifiers.HasFlag(ModifierKeys.Alt))
+            terminalModifiers |= TerminalKeyModifiers.Alt;
+        if (modifiers.HasFlag(ModifierKeys.Control))
+            terminalModifiers |= TerminalKeyModifiers.Control;
+        if (modifiers.HasFlag(ModifierKeys.Windows))
+            terminalModifiers |= TerminalKeyModifiers.Meta;
+
+        return terminalModifiers;
+    }
+
+    private static bool TryMapTerminalKey(Key key, out TerminalKey terminalKey)
+    {
+        terminalKey = key switch
         {
-            var appSeq = key switch
-            {
-                Key.Up => "\x1bOA",
-                Key.Down => "\x1bOB",
-                Key.Right => "\x1bOC",
-                Key.Left => "\x1bOD",
-                Key.Home => "\x1bOH",
-                Key.End => "\x1bOF",
-                _ => (string?)null,
-            };
-            if (appSeq != null) return appSeq;
+            Key.Enter => TerminalKey.Enter,
+            Key.Return => TerminalKey.Enter,
+            Key.Escape => TerminalKey.Escape,
+            Key.Back => TerminalKey.Backspace,
+            Key.Tab => TerminalKey.Tab,
+            Key.Up => TerminalKey.Up,
+            Key.Down => TerminalKey.Down,
+            Key.Right => TerminalKey.Right,
+            Key.Left => TerminalKey.Left,
+            Key.Home => TerminalKey.Home,
+            Key.End => TerminalKey.End,
+            Key.Insert => TerminalKey.Insert,
+            Key.Delete => TerminalKey.Delete,
+            Key.PageUp => TerminalKey.PageUp,
+            Key.PageDown => TerminalKey.PageDown,
+            Key.F1 => TerminalKey.F1,
+            Key.F2 => TerminalKey.F2,
+            Key.F3 => TerminalKey.F3,
+            Key.F4 => TerminalKey.F4,
+            Key.F5 => TerminalKey.F5,
+            Key.F6 => TerminalKey.F6,
+            Key.F7 => TerminalKey.F7,
+            Key.F8 => TerminalKey.F8,
+            Key.F9 => TerminalKey.F9,
+            Key.F10 => TerminalKey.F10,
+            Key.F11 => TerminalKey.F11,
+            Key.F12 => TerminalKey.F12,
+            Key.NumPad0 => TerminalKey.Keypad0,
+            Key.NumPad1 => TerminalKey.Keypad1,
+            Key.NumPad2 => TerminalKey.Keypad2,
+            Key.NumPad3 => TerminalKey.Keypad3,
+            Key.NumPad4 => TerminalKey.Keypad4,
+            Key.NumPad5 => TerminalKey.Keypad5,
+            Key.NumPad6 => TerminalKey.Keypad6,
+            Key.NumPad7 => TerminalKey.Keypad7,
+            Key.NumPad8 => TerminalKey.Keypad8,
+            Key.NumPad9 => TerminalKey.Keypad9,
+            Key.Decimal => TerminalKey.KeypadDecimal,
+            Key.Add => TerminalKey.KeypadAdd,
+            Key.Subtract => TerminalKey.KeypadSubtract,
+            Key.Multiply => TerminalKey.KeypadMultiply,
+            Key.Divide => TerminalKey.KeypadDivide,
+            _ => default,
+        };
+
+        if (key >= Key.F1 && key <= Key.F12)
+            return true;
+        if (key >= Key.NumPad0 && key <= Key.NumPad9)
+            return true;
+
+        return key is Key.Enter
+            or Key.Return
+            or Key.Escape
+            or Key.Back
+            or Key.Tab
+            or Key.Up
+            or Key.Down
+            or Key.Right
+            or Key.Left
+            or Key.Home
+            or Key.End
+            or Key.Insert
+            or Key.Delete
+            or Key.PageUp
+            or Key.PageDown
+            or Key.Decimal
+            or Key.Add
+            or Key.Subtract
+            or Key.Multiply
+            or Key.Divide;
+    }
+
+    private static bool TryGetCtrlLetterSequence(Key key, out string sequence)
+    {
+        if (key < Key.A || key > Key.Z)
+        {
+            sequence = string.Empty;
+            return false;
         }
 
-        return key switch
-        {
-            Key.Enter => "\r",
-            Key.Escape => "\x1b",
-            Key.Back => "\x7f",
-            Key.Tab => modifiers.HasFlag(ModifierKeys.Shift) ? "\x1b[Z" : "\t",
-            Key.Up => "\x1b[A",
-            Key.Down => "\x1b[B",
-            Key.Right => "\x1b[C",
-            Key.Left => "\x1b[D",
-            Key.Home => "\x1b[H",
-            Key.End => "\x1b[F",
-            Key.Insert => "\x1b[2~",
-            Key.Delete => "\x1b[3~",
-            Key.PageUp => "\x1b[5~",
-            Key.PageDown => "\x1b[6~",
-            Key.F1 => "\x1bOP",
-            Key.F2 => "\x1bOQ",
-            Key.F3 => "\x1bOR",
-            Key.F4 => "\x1bOS",
-            Key.F5 => "\x1b[15~",
-            Key.F6 => "\x1b[17~",
-            Key.F7 => "\x1b[18~",
-            Key.F8 => "\x1b[19~",
-            Key.F9 => "\x1b[20~",
-            Key.F10 => "\x1b[21~",
-            Key.F11 => "\x1b[23~",
-            Key.F12 => "\x1b[24~",
-            _ => null,
-        };
+        return TerminalKeyEncoder.TryEncodeControlLetter((char)('A' + key - Key.A), out sequence);
     }
 
     public void UpdateTheme(GhosttyTheme theme)

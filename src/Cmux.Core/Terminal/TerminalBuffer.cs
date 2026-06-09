@@ -9,7 +9,9 @@ public class TerminalBuffer
 {
     private TerminalCell[,] _cells;
     private readonly ScrollbackBuffer<TerminalCell[]> _scrollback;
+    private readonly ScrollbackBuffer<bool> _scrollbackWrapped;
     private readonly int _maxScrollback;
+    private bool[] _rowWrapped;
 
     public int Cols { get; private set; }
     public int Rows { get; private set; }
@@ -34,7 +36,12 @@ public class TerminalBuffer
     public bool AutoWrapMode { get; set; } = true;
     public bool InsertMode { get; set; }
     public bool ApplicationCursorKeys { get; set; }
+    public bool ApplicationKeypad { get; set; }
+    public bool AutoNewlineMode { get; set; }
     public bool BracketedPasteMode { get; set; }
+    public bool FocusEventMode { get; set; }
+    public bool AltSendsEscape { get; set; } = true;
+    public bool MetaSendsEscape { get; set; } = true;
     public bool IsAlternateScreen { get; private set; }
 
     // Mouse tracking modes
@@ -42,6 +49,7 @@ public class TerminalBuffer
     public bool MouseTrackingButton { get; set; }    // Mode 1002: button + motion while pressed
     public bool MouseTrackingAny { get; set; }       // Mode 1003: all motion
     public bool MouseSgrExtended { get; set; }       // Mode 1006: SGR extended coordinates
+    public bool MouseAlternateScroll { get; set; }   // Mode 1007: wheel sends cursor keys in alternate screen
     public bool MouseEnabled => MouseTrackingNormal || MouseTrackingButton || MouseTrackingAny;
 
     private bool _wrapPending;
@@ -49,6 +57,8 @@ public class TerminalBuffer
     // Alternate screen buffer state
     private TerminalCell[,]? _savedMainCells;
     private List<TerminalCell[]>? _savedMainScrollbackList;
+    private List<bool>? _savedMainScrollbackWrappedList;
+    private bool[]? _savedMainRowWrapped;
     private int _savedMainCursorRow;
     private int _savedMainCursorCol;
     private TerminalAttribute _savedMainAttribute;
@@ -64,9 +74,11 @@ public class TerminalBuffer
         Rows = Math.Max(1, rows);
         _maxScrollback = maxScrollback;
         _scrollback = new ScrollbackBuffer<TerminalCell[]>(maxScrollback);
+        _scrollbackWrapped = new ScrollbackBuffer<bool>(maxScrollback);
         ScrollTop = 0;
         ScrollBottom = Rows - 1;
         _cells = new TerminalCell[Rows, Cols];
+        _rowWrapped = new bool[Rows];
         Clear();
     }
 
@@ -75,6 +87,28 @@ public class TerminalBuffer
         for (int r = 0; r < Rows; r++)
             for (int c = 0; c < Cols; c++)
                 _cells[r, c] = TerminalCell.Empty;
+
+        Array.Clear(_rowWrapped, 0, _rowWrapped.Length);
+    }
+
+    public void ResetModes()
+    {
+        OriginMode = false;
+        AutoWrapMode = true;
+        InsertMode = false;
+        ApplicationCursorKeys = false;
+        ApplicationKeypad = false;
+        AutoNewlineMode = false;
+        BracketedPasteMode = false;
+        FocusEventMode = false;
+        AltSendsEscape = true;
+        MetaSendsEscape = true;
+        CursorVisible = true;
+        MouseTrackingNormal = false;
+        MouseTrackingButton = false;
+        MouseTrackingAny = false;
+        MouseSgrExtended = false;
+        MouseAlternateScroll = false;
     }
 
     public ref TerminalCell CellAt(int row, int col)
@@ -105,13 +139,25 @@ public class TerminalBuffer
     public void SetChar(int row, int col, char ch, TerminalAttribute attr)
     {
         if (row < 0 || row >= Rows || col < 0 || col >= Cols) return;
+        var displayWidth = TerminalWidth.GetWidth(ch);
+        if (displayWidth <= 0) return;
+        var width = Math.Min(displayWidth, Cols - col);
+        if (width <= 0) return;
+
+        ClearCellForWrite(row, col);
+        if (width == 2)
+            ClearCellForWrite(row, col + 1);
+
         _cells[row, col] = new TerminalCell
         {
             Character = ch,
             Attribute = attr,
             IsDirty = true,
-            Width = 1,
+            Width = width,
         };
+
+        if (width == 2)
+            _cells[row, col + 1] = CreateContinuationCell(attr);
     }
 
     /// <summary>
@@ -123,38 +169,59 @@ public class TerminalBuffer
         if (!ClampCursorToBounds())
             return;
 
+        var displayWidth = TerminalWidth.GetWidth(c);
+        if (displayWidth <= 0)
+            return;
+        var width = Math.Min(displayWidth, Cols);
+
         if (_wrapPending && AutoWrapMode)
         {
+            _rowWrapped[CursorRow] = true;
             CarriageReturn();
             LineFeed();
             _wrapPending = false;
         }
 
-        if (InsertMode)
+        if (width == 2 && CursorCol == Cols - 1)
         {
-            // Shift characters right
-            for (int col = Cols - 1; col > CursorCol; col--)
-                _cells[CursorRow, col] = _cells[CursorRow, col - 1];
+            if (!AutoWrapMode)
+                return;
+
+            CarriageReturn();
+            LineFeed();
+            if (!ClampCursorToBounds())
+                return;
         }
+
+        if (InsertMode)
+            ShiftCellsRight(CursorRow, CursorCol, width);
 
         if (CursorRow >= 0 && CursorRow < Rows && CursorCol >= 0 && CursorCol < Cols)
         {
+            ClearCellForWrite(CursorRow, CursorCol);
+            if (width == 2)
+                ClearCellForWrite(CursorRow, CursorCol + 1);
+
             _cells[CursorRow, CursorCol] = new TerminalCell
             {
                 Character = c,
                 Attribute = CurrentAttribute,
                 IsDirty = true,
-                Width = 1,
+                Width = width,
             };
+
+            if (width == 2)
+                _cells[CursorRow, CursorCol + 1] = CreateContinuationCell(CurrentAttribute);
         }
 
-        if (CursorCol + 1 >= Cols)
+        if (CursorCol + width >= Cols)
         {
+            CursorCol = Cols - 1;
             _wrapPending = true;
         }
         else
         {
-            CursorCol++;
+            CursorCol += width;
         }
     }
 
@@ -217,14 +284,18 @@ public class TerminalBuffer
                     scrolledLine[c] = _cells[0, c];
 
                 _scrollback.Add(scrolledLine);
+                _scrollbackWrapped.Add(_rowWrapped[0]);
             }
 
             // Shift lines up within the scroll region
+            for (int r = ScrollTop; r < ScrollBottom; r++)
+                _rowWrapped[r] = _rowWrapped[r + 1];
             for (int r = ScrollTop; r < ScrollBottom; r++)
                 for (int c = 0; c < Cols; c++)
                     _cells[r, c] = _cells[r + 1, c];
 
             // Clear the bottom line
+            _rowWrapped[ScrollBottom] = false;
             for (int c = 0; c < Cols; c++)
                 _cells[ScrollBottom, c] = TerminalCell.Empty;
         }
@@ -240,9 +311,12 @@ public class TerminalBuffer
         for (int n = 0; n < lines; n++)
         {
             for (int r = ScrollBottom; r > ScrollTop; r--)
+                _rowWrapped[r] = _rowWrapped[r - 1];
+            for (int r = ScrollBottom; r > ScrollTop; r--)
                 for (int c = 0; c < Cols; c++)
                     _cells[r, c] = _cells[r - 1, c];
 
+            _rowWrapped[ScrollTop] = false;
             for (int c = 0; c < Cols; c++)
                 _cells[ScrollTop, c] = TerminalCell.Empty;
         }
@@ -262,18 +336,21 @@ public class TerminalBuffer
         switch (mode)
         {
             case 0: // Cursor to end
-                for (int c = CursorCol; c < Cols; c++)
-                    _cells[CursorRow, c] = TerminalCell.Empty;
+                ClearRange(CursorRow, CursorCol, Cols - 1);
+                _rowWrapped[CursorRow] = false;
                 for (int r = CursorRow + 1; r < Rows; r++)
-                    for (int c = 0; c < Cols; c++)
-                        _cells[r, c] = TerminalCell.Empty;
+                {
+                    _rowWrapped[r] = false;
+                    ClearRange(r, 0, Cols - 1);
+                }
                 break;
             case 1: // Start to cursor
                 for (int r = 0; r < CursorRow; r++)
-                    for (int c = 0; c < Cols; c++)
-                        _cells[r, c] = TerminalCell.Empty;
-                for (int c = 0; c <= CursorCol; c++)
-                    _cells[CursorRow, c] = TerminalCell.Empty;
+                {
+                    _rowWrapped[r] = false;
+                    ClearRange(r, 0, Cols - 1);
+                }
+                ClearRange(CursorRow, 0, CursorCol);
                 break;
             case 2: // All
                 Clear();
@@ -281,6 +358,7 @@ public class TerminalBuffer
             case 3: // All + scrollback
                 Clear();
                 _scrollback.Clear();
+                _scrollbackWrapped.Clear();
                 break;
         }
 
@@ -299,16 +377,15 @@ public class TerminalBuffer
         switch (mode)
         {
             case 0:
-                for (int c = CursorCol; c < Cols; c++)
-                    _cells[CursorRow, c] = TerminalCell.Empty;
+                ClearRange(CursorRow, CursorCol, Cols - 1);
+                _rowWrapped[CursorRow] = false;
                 break;
             case 1:
-                for (int c = 0; c <= CursorCol; c++)
-                    _cells[CursorRow, c] = TerminalCell.Empty;
+                ClearRange(CursorRow, 0, CursorCol);
                 break;
             case 2:
-                for (int c = 0; c < Cols; c++)
-                    _cells[CursorRow, c] = TerminalCell.Empty;
+                ClearRange(CursorRow, 0, Cols - 1);
+                _rowWrapped[CursorRow] = false;
                 break;
         }
 
@@ -321,8 +398,12 @@ public class TerminalBuffer
             return;
 
         count = Math.Max(0, count);
-        for (int i = 0; i < count && CursorCol + i < Cols; i++)
-            _cells[CursorRow, CursorCol + i] = TerminalCell.Empty;
+        if (count == 0)
+            return;
+
+        ClearRange(CursorRow, CursorCol, Math.Min(Cols - 1, CursorCol + count - 1));
+        if (CursorCol + count >= Cols)
+            _rowWrapped[CursorRow] = false;
         RaiseContentChanged();
     }
 
@@ -337,8 +418,11 @@ public class TerminalBuffer
         for (int n = 0; n < count; n++)
         {
             for (int r = ScrollBottom; r > CursorRow; r--)
+                _rowWrapped[r] = _rowWrapped[r - 1];
+            for (int r = ScrollBottom; r > CursorRow; r--)
                 for (int c = 0; c < Cols; c++)
                     _cells[r, c] = _cells[r - 1, c];
+            _rowWrapped[CursorRow] = false;
             for (int c = 0; c < Cols; c++)
                 _cells[CursorRow, c] = TerminalCell.Empty;
         }
@@ -355,8 +439,11 @@ public class TerminalBuffer
         for (int n = 0; n < count; n++)
         {
             for (int r = CursorRow; r < ScrollBottom; r++)
+                _rowWrapped[r] = _rowWrapped[r + 1];
+            for (int r = CursorRow; r < ScrollBottom; r++)
                 for (int c = 0; c < Cols; c++)
                     _cells[r, c] = _cells[r + 1, c];
+            _rowWrapped[ScrollBottom] = false;
             for (int c = 0; c < Cols; c++)
                 _cells[ScrollBottom, c] = TerminalCell.Empty;
         }
@@ -375,6 +462,8 @@ public class TerminalBuffer
                 _cells[CursorRow, c] = _cells[CursorRow, c - 1];
             _cells[CursorRow, CursorCol] = TerminalCell.Empty;
         }
+        NormalizeWideCells(CursorRow);
+        _rowWrapped[CursorRow] = false;
         RaiseContentChanged();
     }
 
@@ -390,6 +479,8 @@ public class TerminalBuffer
                 _cells[CursorRow, c] = _cells[CursorRow, c + 1];
             _cells[CursorRow, Cols - 1] = TerminalCell.Empty;
         }
+        NormalizeWideCells(CursorRow);
+        _rowWrapped[CursorRow] = false;
         RaiseContentChanged();
     }
 
@@ -432,14 +523,18 @@ public class TerminalBuffer
         // Save main screen state
         _savedMainCells = _cells;
         _savedMainScrollbackList = _scrollback.ToList();
+        _savedMainScrollbackWrappedList = _scrollbackWrapped.ToList();
+        _savedMainRowWrapped = _rowWrapped.ToArray();
         _savedMainCursorRow = CursorRow;
         _savedMainCursorCol = CursorCol;
         _savedMainAttribute = CurrentAttribute;
 
         // Create a fresh screen
         _cells = new TerminalCell[Rows, Cols];
+        _rowWrapped = new bool[Rows];
         Clear();
         _scrollback.Clear();
+        _scrollbackWrapped.Clear();
 
         CursorRow = 0;
         CursorCol = 0;
@@ -463,11 +558,23 @@ public class TerminalBuffer
             _savedMainCells = null;
         }
 
+        if (_savedMainRowWrapped != null)
+        {
+            _rowWrapped = _savedMainRowWrapped;
+            _savedMainRowWrapped = null;
+        }
+
         _scrollback.Clear();
+        _scrollbackWrapped.Clear();
         if (_savedMainScrollbackList != null)
         {
             _scrollback.AddRange(_savedMainScrollbackList);
             _savedMainScrollbackList = null;
+        }
+        if (_savedMainScrollbackWrappedList != null)
+        {
+            _scrollbackWrapped.AddRange(_savedMainScrollbackWrappedList);
+            _savedMainScrollbackWrappedList = null;
         }
 
         CursorRow = _savedMainCursorRow;
@@ -524,33 +631,464 @@ public class TerminalBuffer
     }
 
     /// <summary>
-    /// Resizes the buffer, preserving content as much as possible.
+    /// Resizes the buffer and reflows soft-wrapped lines where wrap metadata is available.
     /// </summary>
     public void Resize(int newCols, int newRows)
     {
         newCols = Math.Max(1, newCols);
         newRows = Math.Max(1, newRows);
 
+        var oldCursorRow = CursorRow;
+        var resizeRows = CollectResizeRows();
+        var logicalLines = BuildLogicalLinesForResize(
+            resizeRows,
+            _scrollback.Count + CursorRow,
+            CursorCol,
+            out var cursorLogicalLine,
+            out var cursorLogicalOffset);
+        var reflowedRows = ReflowLogicalLines(
+            logicalLines,
+            newCols,
+            cursorLogicalLine,
+            cursorLogicalOffset,
+            out var reflowedCursorRow,
+            out var reflowedCursorCol);
+
         var newCells = new TerminalCell[newRows, newCols];
         for (int r = 0; r < newRows; r++)
             for (int c = 0; c < newCols; c++)
                 newCells[r, c] = TerminalCell.Empty;
 
-        int copyRows = Math.Min(Rows, newRows);
-        int copyCols = Math.Min(Cols, newCols);
-        for (int r = 0; r < copyRows; r++)
-            for (int c = 0; c < copyCols; c++)
-                newCells[r, c] = _cells[r, c];
+        var newRowWrapped = new bool[newRows];
+        var firstScreenRow = CalculateFirstScreenRow(reflowedRows.Count, newRows, reflowedCursorRow, oldCursorRow);
+
+        _scrollback.Clear();
+        _scrollbackWrapped.Clear();
+        for (int i = 0; i < firstScreenRow; i++)
+        {
+            _scrollback.Add(reflowedRows[i].Cells);
+            _scrollbackWrapped.Add(reflowedRows[i].Wrapped);
+        }
+
+        for (int sourceRow = firstScreenRow; sourceRow < reflowedRows.Count; sourceRow++)
+        {
+            var targetRow = sourceRow - firstScreenRow;
+            if (targetRow >= newRows)
+                break;
+
+            for (int c = 0; c < newCols; c++)
+                newCells[targetRow, c] = reflowedRows[sourceRow].Cells[c];
+            newRowWrapped[targetRow] = reflowedRows[sourceRow].Wrapped;
+        }
 
         _cells = newCells;
+        _rowWrapped = newRowWrapped;
         Cols = newCols;
         Rows = newRows;
+        for (int r = 0; r < Rows; r++)
+            NormalizeWideCells(r);
         ScrollTop = 0;
         ScrollBottom = newRows - 1;
-        CursorRow = Math.Min(CursorRow, newRows - 1);
-        CursorCol = Math.Min(CursorCol, newCols - 1);
+        CursorRow = Math.Clamp(reflowedCursorRow - firstScreenRow, 0, newRows - 1);
+        CursorCol = Math.Clamp(reflowedCursorCol, 0, newCols - 1);
+        _wrapPending = false;
 
         RaiseContentChanged();
+    }
+
+    public TerminalTextAnchor CreateTextAnchor(int visualRow, int col, int scrollOffset = 0)
+    {
+        var absoluteRow = _scrollback.Count + scrollOffset + visualRow;
+        return CreateTextAnchorFromAbsolute(absoluteRow, col);
+    }
+
+    public bool TryResolveTextAnchor(
+        TerminalTextAnchor anchor,
+        int scrollOffset,
+        out SelectionPoint point)
+    {
+        point = default;
+
+        if (!TryResolveTextAnchorAbsolute(anchor, out var absoluteRow, out var col))
+            return false;
+
+        point = new SelectionPoint(absoluteRow - (_scrollback.Count + scrollOffset), col);
+        return true;
+    }
+
+    public bool TryResolveTextAnchorAbsolute(
+        TerminalTextAnchor anchor,
+        out int absoluteRow,
+        out int col)
+    {
+        absoluteRow = 0;
+        col = 0;
+
+        var rows = CollectResizeRows();
+        var logicalLine = 0;
+        var logicalOffset = 0;
+
+        foreach (var row in rows)
+        {
+            var cells = ExtractLogicalCells(row.Cells, trimTrailingSpaces: !row.Wrapped);
+            var rowWidth = GetDisplayWidth(cells);
+
+            var rowEndOffset = logicalOffset + rowWidth;
+            if (logicalLine == anchor.LogicalLine &&
+                (anchor.DisplayOffset < rowEndOffset || !row.Wrapped))
+            {
+                absoluteRow = row.AbsoluteRow;
+                col = GetColumnForDisplayOffset(row.Cells, anchor.DisplayOffset - logicalOffset);
+                return true;
+            }
+
+            logicalOffset += rowWidth;
+            if (!row.Wrapped)
+            {
+                logicalLine++;
+                logicalOffset = 0;
+            }
+        }
+
+        if (rows.Count == 0)
+            return false;
+
+        var last = rows[^1];
+        absoluteRow = last.AbsoluteRow;
+        col = GetLastSelectableColumn(last.Cells);
+        return anchor.LogicalLine <= logicalLine;
+    }
+
+    private TerminalTextAnchor CreateTextAnchorFromAbsolute(int absoluteRow, int col)
+    {
+        var rows = CollectResizeRows();
+        var logicalLine = 0;
+        var logicalOffset = 0;
+
+        foreach (var row in rows)
+        {
+            if (row.AbsoluteRow == absoluteRow)
+            {
+                return new TerminalTextAnchor(
+                    logicalLine,
+                    logicalOffset + GetDisplayWidthBeforeColumn(row.Cells, col));
+            }
+
+            logicalOffset += GetDisplayWidth(ExtractLogicalCells(row.Cells, trimTrailingSpaces: !row.Wrapped));
+            if (!row.Wrapped)
+            {
+                logicalLine++;
+                logicalOffset = 0;
+            }
+        }
+
+        return new TerminalTextAnchor(Math.Max(0, logicalLine - 1), logicalOffset);
+    }
+
+    private List<ResizeRow> CollectResizeRows()
+    {
+        var rows = new List<ResizeRow>(_scrollback.Count + Rows);
+        for (int i = 0; i < _scrollback.Count; i++)
+        {
+            var wrapped = i < _scrollbackWrapped.Count && _scrollbackWrapped[i];
+            rows.Add(new ResizeRow(_scrollback[i], wrapped, i));
+        }
+
+        var lastScreenRow = Math.Max(CursorRow, FindLastNonEmptyScreenRow());
+        for (int row = 0; row <= lastScreenRow; row++)
+            rows.Add(new ResizeRow(GetLine(row), _rowWrapped[row], _scrollback.Count + row));
+
+        if (rows.Count == 0)
+            rows.Add(new ResizeRow(CreateEmptyLine(Cols), wrapped: false, absoluteRow: _scrollback.Count));
+
+        return rows;
+    }
+
+    private int FindLastNonEmptyScreenRow()
+    {
+        for (int row = Rows - 1; row >= 0; row--)
+        {
+            if (_rowWrapped[row] || !IsLineEmpty(GetLine(row)))
+                return row;
+        }
+
+        return -1;
+    }
+
+    private static bool IsLineEmpty(TerminalCell[] line)
+    {
+        foreach (var cell in line)
+        {
+            if (cell.Width == 0)
+                continue;
+            if (cell.Character != '\0' && cell.Character != ' ')
+                return false;
+        }
+
+        return true;
+    }
+
+    private static List<List<TerminalCell>> BuildLogicalLinesForResize(
+        List<ResizeRow> rows,
+        int cursorAbsoluteRow,
+        int cursorCol,
+        out int cursorLogicalLine,
+        out int cursorLogicalOffset)
+    {
+        var logicalLines = new List<List<TerminalCell>>();
+        var current = new List<TerminalCell>();
+        cursorLogicalLine = 0;
+        cursorLogicalOffset = 0;
+        var cursorFound = false;
+
+        foreach (var row in rows)
+        {
+            if (!cursorFound && row.AbsoluteRow == cursorAbsoluteRow)
+            {
+                cursorLogicalLine = logicalLines.Count;
+                cursorLogicalOffset = GetDisplayWidth(current) + GetDisplayWidthBeforeColumn(row.Cells, cursorCol);
+                cursorFound = true;
+            }
+
+            current.AddRange(ExtractLogicalCells(row.Cells, trimTrailingSpaces: !row.Wrapped));
+
+            if (!row.Wrapped)
+            {
+                logicalLines.Add(current);
+                current = new List<TerminalCell>();
+            }
+        }
+
+        if (current.Count > 0 || logicalLines.Count == 0)
+            logicalLines.Add(current);
+
+        if (!cursorFound)
+        {
+            cursorLogicalLine = logicalLines.Count - 1;
+            cursorLogicalOffset = GetDisplayWidth(logicalLines[cursorLogicalLine]);
+        }
+
+        return logicalLines;
+    }
+
+    private static List<TerminalCell> ExtractLogicalCells(TerminalCell[] line, bool trimTrailingSpaces)
+    {
+        var cells = new List<TerminalCell>(line.Length);
+
+        foreach (var source in line)
+        {
+            if (source.Width == 0)
+                continue;
+
+            var cell = source;
+            cell.Character = cell.Character == '\0' ? ' ' : cell.Character;
+            cell.Width = NormalizeLogicalWidth(cell);
+            cell.IsDirty = true;
+            cells.Add(cell);
+        }
+
+        if (trimTrailingSpaces)
+        {
+            while (cells.Count > 0 && cells[^1].Character == ' ' && cells[^1].Width == 1)
+                cells.RemoveAt(cells.Count - 1);
+        }
+
+        return cells;
+    }
+
+    private static int GetDisplayWidth(List<TerminalCell> cells)
+    {
+        var width = 0;
+        foreach (var cell in cells)
+            width += NormalizeLogicalWidth(cell);
+        return width;
+    }
+
+    private static int GetDisplayWidthBeforeColumn(TerminalCell[] line, int col)
+    {
+        var width = 0;
+        var end = Math.Clamp(col, 0, line.Length);
+        for (int i = 0; i < end; i++)
+        {
+            if (line[i].Width == 0)
+                continue;
+            width += NormalizeLogicalWidth(line[i]);
+        }
+
+        return width;
+    }
+
+    private static int GetColumnForDisplayOffset(TerminalCell[] line, int displayOffset)
+    {
+        displayOffset = Math.Max(0, displayOffset);
+
+        var width = 0;
+        for (int col = 0; col < line.Length; col++)
+        {
+            var cell = line[col];
+            if (cell.Width == 0)
+                continue;
+
+            var cellWidth = NormalizeLogicalWidth(cell);
+            if (width + cellWidth > displayOffset)
+                return col;
+
+            width += cellWidth;
+            if (width == displayOffset)
+                return Math.Min(line.Length - 1, col + cellWidth);
+        }
+
+        return GetLastSelectableColumn(line);
+    }
+
+    private static int GetLastSelectableColumn(TerminalCell[] line)
+    {
+        for (int col = line.Length - 1; col >= 0; col--)
+        {
+            if (line[col].Width != 0)
+                return col;
+        }
+
+        return 0;
+    }
+
+    private static List<ReflowedRow> ReflowLogicalLines(
+        List<List<TerminalCell>> logicalLines,
+        int cols,
+        int cursorLogicalLine,
+        int cursorLogicalOffset,
+        out int cursorRow,
+        out int cursorCol)
+    {
+        var rows = new List<ReflowedRow>();
+        var capturedCursorRow = 0;
+        var capturedCursorCol = 0;
+        var cursorSet = false;
+
+        for (int lineIndex = 0; lineIndex < logicalLines.Count; lineIndex++)
+        {
+            var logicalLine = logicalLines[lineIndex];
+            var current = CreateEmptyLine(cols);
+            var col = 0;
+            var logicalOffset = 0;
+
+            void CaptureCursor()
+            {
+                if (cursorSet || lineIndex != cursorLogicalLine || cursorLogicalOffset > logicalOffset)
+                    return;
+
+                capturedCursorRow = rows.Count;
+                capturedCursorCol = Math.Clamp(col, 0, cols - 1);
+                cursorSet = true;
+            }
+
+            if (logicalLine.Count == 0)
+            {
+                CaptureCursor();
+                rows.Add(new ReflowedRow(current, wrapped: false));
+                continue;
+            }
+
+            CaptureCursor();
+            foreach (var cell in logicalLine)
+            {
+                var width = Math.Min(NormalizeLogicalWidth(cell), cols);
+                if (col > 0 && col + width > cols)
+                {
+                    rows.Add(new ReflowedRow(current, wrapped: true));
+                    current = CreateEmptyLine(cols);
+                    col = 0;
+                    CaptureCursor();
+                }
+
+                PlaceCell(current, col, cell, width);
+                col += width;
+                logicalOffset += width;
+                CaptureCursor();
+            }
+
+            rows.Add(new ReflowedRow(current, wrapped: false));
+        }
+
+        if (rows.Count == 0)
+            rows.Add(new ReflowedRow(CreateEmptyLine(cols), wrapped: false));
+
+        if (!cursorSet)
+        {
+            capturedCursorRow = rows.Count - 1;
+            capturedCursorCol = 0;
+        }
+
+        cursorRow = capturedCursorRow;
+        cursorCol = capturedCursorCol;
+        return rows;
+    }
+
+    private static int CalculateFirstScreenRow(int rowCount, int rows, int cursorRow, int oldCursorRow)
+    {
+        if (rowCount <= rows)
+            return 0;
+
+        var desiredCursorRow = Math.Clamp(oldCursorRow, 0, rows - 1);
+        return Math.Clamp(cursorRow - desiredCursorRow, 0, rowCount - rows);
+    }
+
+    private static int NormalizeLogicalWidth(TerminalCell cell)
+    {
+        if (cell.Width == 2)
+            return 2;
+
+        var width = TerminalWidth.GetWidth(cell.Character);
+        return width == 2 ? 2 : 1;
+    }
+
+    private static TerminalCell[] CreateEmptyLine(int cols)
+    {
+        var line = new TerminalCell[cols];
+        for (int i = 0; i < cols; i++)
+            line[i] = TerminalCell.Empty;
+        return line;
+    }
+
+    private static void PlaceCell(TerminalCell[] line, int col, TerminalCell source, int width)
+    {
+        if (col < 0 || col >= line.Length)
+            return;
+
+        var cell = source;
+        cell.Character = cell.Character == '\0' ? ' ' : cell.Character;
+        cell.Width = width;
+        cell.IsDirty = true;
+        line[col] = cell;
+
+        if (width == 2 && col + 1 < line.Length)
+            line[col + 1] = CreateContinuationCell(cell.Attribute);
+    }
+
+    private readonly struct ResizeRow
+    {
+        public ResizeRow(TerminalCell[] cells, bool wrapped, int absoluteRow)
+        {
+            Cells = cells;
+            Wrapped = wrapped;
+            AbsoluteRow = absoluteRow;
+        }
+
+        public TerminalCell[] Cells { get; }
+        public bool Wrapped { get; }
+        public int AbsoluteRow { get; }
+    }
+
+    private readonly struct ReflowedRow
+    {
+        public ReflowedRow(TerminalCell[] cells, bool wrapped)
+        {
+            Cells = cells;
+            Wrapped = wrapped;
+        }
+
+        public TerminalCell[] Cells { get; }
+        public bool Wrapped { get; }
     }
 
     public string ExportPlainText(int maxScrollbackLines = 20000)
@@ -603,8 +1141,12 @@ public class TerminalBuffer
         if (snapshot == null) return;
 
         _scrollback.Clear();
+        _scrollbackWrapped.Clear();
         foreach (var line in snapshot.ScrollbackLines)
+        {
             _scrollback.Add(TextToLine(line, Cols));
+            _scrollbackWrapped.Add(false);
+        }
 
         Clear();
 
@@ -612,17 +1154,9 @@ public class TerminalBuffer
         for (int row = 0; row < rowCount; row++)
         {
             var text = snapshot.ScreenLines[row];
-            int colCount = Math.Min(Cols, text.Length);
-            for (int col = 0; col < colCount; col++)
-            {
-                _cells[row, col] = new TerminalCell
-                {
-                    Character = text[col],
-                    Attribute = TerminalAttribute.Default,
-                    IsDirty = true,
-                    Width = 1,
-                };
-            }
+            var line = TextToLine(text, Cols);
+            for (int col = 0; col < Cols; col++)
+                _cells[row, col] = line[col];
         }
 
         CursorRow = Math.Clamp(snapshot.CursorRow, 0, Rows - 1);
@@ -630,6 +1164,97 @@ public class TerminalBuffer
         ResetScrollRegion();
         MarkAllDirty();
         RaiseContentChanged();
+    }
+
+    private static TerminalCell CreateContinuationCell(TerminalAttribute attr)
+    {
+        return new TerminalCell
+        {
+            Character = '\0',
+            Attribute = attr,
+            IsDirty = true,
+            Width = 0,
+        };
+    }
+
+    private void ShiftCellsRight(int row, int startCol, int count)
+    {
+        if (row < 0 || row >= Rows || startCol < 0 || startCol >= Cols || count <= 0)
+            return;
+
+        for (int col = Cols - 1; col >= startCol + count; col--)
+            _cells[row, col] = _cells[row, col - count];
+
+        for (int col = startCol; col < Math.Min(Cols, startCol + count); col++)
+            _cells[row, col] = TerminalCell.Empty;
+
+        NormalizeWideCells(row);
+    }
+
+    private void ClearCellForWrite(int row, int col)
+    {
+        if (row < 0 || row >= Rows || col < 0 || col >= Cols)
+            return;
+
+        if (_cells[row, col].Width == 0 && col > 0 && _cells[row, col - 1].Width == 2)
+            _cells[row, col - 1] = TerminalCell.Empty;
+        else if (_cells[row, col].Width == 2 && col + 1 < Cols && _cells[row, col + 1].Width == 0)
+            _cells[row, col + 1] = TerminalCell.Empty;
+
+        _cells[row, col] = TerminalCell.Empty;
+    }
+
+    private void ClearRange(int row, int startCol, int endCol)
+    {
+        if (row < 0 || row >= Rows || Cols <= 0)
+            return;
+
+        startCol = Math.Clamp(startCol, 0, Cols - 1);
+        endCol = Math.Clamp(endCol, 0, Cols - 1);
+        if (endCol < startCol)
+            return;
+
+        if (startCol > 0 && _cells[row, startCol].Width == 0 && _cells[row, startCol - 1].Width == 2)
+            startCol--;
+        if (endCol + 1 < Cols && _cells[row, endCol].Width == 2 && _cells[row, endCol + 1].Width == 0)
+            endCol++;
+
+        for (int col = startCol; col <= endCol; col++)
+            _cells[row, col] = TerminalCell.Empty;
+    }
+
+    private void NormalizeWideCells(int row)
+    {
+        if (row < 0 || row >= Rows)
+            return;
+
+        for (int col = 0; col < Cols; col++)
+        {
+            var cell = _cells[row, col];
+
+            if (cell.Width == 0)
+            {
+                if (col == 0 || _cells[row, col - 1].Width != 2)
+                    _cells[row, col] = TerminalCell.Empty;
+                continue;
+            }
+
+            if (cell.Width != 2)
+            {
+                if (cell.Width != 1)
+                    _cells[row, col] = TerminalCell.Empty;
+                continue;
+            }
+
+            if (col + 1 >= Cols)
+            {
+                _cells[row, col] = TerminalCell.Empty;
+                continue;
+            }
+
+            _cells[row, col + 1] = CreateContinuationCell(cell.Attribute);
+            col++;
+        }
     }
 
     private bool ClampCursorToBounds()
@@ -644,14 +1269,18 @@ public class TerminalBuffer
 
     private static string LineToText(TerminalCell[] line, int cols)
     {
-        var chars = new char[cols];
+        var chars = new List<char>(cols);
         for (int i = 0; i < cols; i++)
         {
-            var ch = i < line.Length ? line[i].Character : ' ';
-            chars[i] = ch == '\0' ? ' ' : ch;
+            var cell = i < line.Length ? line[i] : TerminalCell.Empty;
+            if (cell.Width == 0)
+                continue;
+
+            var ch = cell.Character;
+            chars.Add(ch == '\0' ? ' ' : ch);
         }
 
-        return new string(chars).TrimEnd();
+        return new string(chars.ToArray()).TrimEnd();
     }
 
     private static TerminalCell[] TextToLine(string? text, int cols)
@@ -662,16 +1291,29 @@ public class TerminalBuffer
 
         if (string.IsNullOrEmpty(text)) return line;
 
-        int len = Math.Min(cols, text.Length);
-        for (int i = 0; i < len; i++)
+        int col = 0;
+        foreach (var ch in text)
         {
-            line[i] = new TerminalCell
+            var displayWidth = TerminalWidth.GetWidth(ch);
+            if (displayWidth <= 0)
+                continue;
+            if (col >= cols)
+                break;
+            var width = Math.Min(displayWidth, cols - col);
+            if (width <= 0)
+                break;
+
+            line[col] = new TerminalCell
             {
-                Character = text[i],
+                Character = ch,
                 Attribute = TerminalAttribute.Default,
                 IsDirty = true,
-                Width = 1,
+                Width = width,
             };
+            if (width == 2)
+                line[col + 1] = CreateContinuationCell(TerminalAttribute.Default);
+
+            col += width;
         }
 
         return line;

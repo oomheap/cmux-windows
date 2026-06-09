@@ -70,3 +70,4 @@ $RECYCLE.BIN/
 *.log
 [Ll]og/
 [Ll]ogs/
+.ace-tool/

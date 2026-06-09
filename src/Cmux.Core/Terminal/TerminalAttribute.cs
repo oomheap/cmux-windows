@@ -109,7 +109,9 @@ public struct TerminalCell
     public char Character;
     public TerminalAttribute Attribute;
     public bool IsDirty;
-    public int Width; // 1 for normal, 2 for wide chars
+    public int Width; // 0 for wide-char continuation, 1 for normal, 2 for wide chars
+
+    public readonly bool IsContinuation => Width == 0;
 
     public static TerminalCell Empty => new()
     {

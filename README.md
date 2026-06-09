@@ -16,7 +16,7 @@ A dark, keyboard-first terminal multiplexer for Windows, inspired by tmux/cmux w
 | You want searchable output history like Termius vault | Anyone reviewing terminal sessions | **Session Vault browser** | Open vault, filter captures, preview transcript, copy/open file |
 | You need dark theme consistency and personalization | Users who care about UX/readability | **Dark UI + terminal theme customization** | Settings (`Ctrl+,`) for colors/font/cursor + workspace accents |
 | You want quick actions without mouse hunting | Keyboard-first power users | **Command palette + shortcuts** | `Ctrl+Shift+P` command palette, menu mirrors key flows |
-| You need automation from scripts/tools | Integrators/agent hooks | **Named pipe CLI API** (`cmux`) | `cmux notify`, `cmux workspace`, `cmux split`, `cmux status` |
+| You need automation from scripts/tools | Integrators/agent hooks | **Named pipe CLI API** (`cmux`) | `cmux notify`, `cmux workspace`, `cmux pane`, `cmux run`, `cmux status` |
 
 ---
 
@@ -115,6 +115,15 @@ dotnet publish src/Cmux.Cli/Cmux.Cli.csproj -c Release -r win-x64 --self-contain
 
 Add `publish/cmux-cli` to `PATH` to use `cmux` globally.
 
+### GitHub Actions package
+
+The repository includes Windows packaging in `.github/workflows/ci.yml`.
+
+- Run **Actions -> CI -> Run workflow** to create a `win-x64` or `win-arm64` zip artifact.
+- Push a version tag like `v1.0.7` to build the same zip and attach it to the GitHub Release.
+
+The package contains the WPF app (`cmuxw.exe`), CLI (`cmux.exe`), and daemon (`cmux-daemon.exe`) as self-contained Windows executables.
+
 ---
 
 ## First 5 minutes (how to use)
@@ -183,13 +192,26 @@ cmux notify --title "Claude Code" --body "Waiting for input"
 
 # Workspace management
 cmux workspace list
-cmux workspace create --name "My Project"
+cmux workspace create --name "My Project" --cwd C:\work\repo
 cmux workspace select --index 0
+cmux workspace next
 
-# Surface/pane actions
+# Surface/tab actions
 cmux surface create
+cmux surface select --index 1
+cmux surface next
+
+# Pane actions
 cmux split right
 cmux split down
+cmux pane list
+cmux pane focus --index 1
+cmux send-keys "npm test" --enter
+cmux run "dotnet test"
+cmux capture-pane --lines 120
+
+# Session restore
+cmux restore-session
 
 # Inspect status
 cmux status

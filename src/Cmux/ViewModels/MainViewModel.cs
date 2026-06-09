@@ -417,14 +417,19 @@ public partial class MainViewModel : ObservableObject
                 "WORKSPACE.LIST" => HandleWorkspaceList(),
                 "WORKSPACE.CREATE" => HandleWorkspaceCreate(args),
                 "WORKSPACE.SELECT" => HandleWorkspaceSelect(args),
+                "WORKSPACE.NEXT" => HandleWorkspaceMove(next: true),
+                "WORKSPACE.PREVIOUS" => HandleWorkspaceMove(next: false),
                 "SURFACE.CREATE" => HandleSurfaceCreate(args),
                 "SURFACE.SELECT" => HandleSurfaceSelect(args),
+                "SURFACE.NEXT" => HandleSurfaceMove(next: true),
+                "SURFACE.PREVIOUS" => HandleSurfaceMove(next: false),
                 "SPLIT.RIGHT" => HandleSplit(SplitDirection.Vertical),
                 "SPLIT.DOWN" => HandleSplit(SplitDirection.Horizontal),
                 "PANE.LIST" => HandlePaneList(args),
                 "PANE.FOCUS" => HandlePaneFocus(args),
                 "PANE.WRITE" => HandlePaneWrite(args),
                 "PANE.READ" => HandlePaneRead(args),
+                "RESTORE_SESSION" or "SESSION.RESTORE" => HandleRestoreSession(),
                 "STATUS" => HandleStatus(),
                 _ => JsonSerializer.Serialize(new { error = $"Unknown command: {command}" }),
             };
@@ -465,7 +470,22 @@ public partial class MainViewModel : ObservableObject
         var ws = Workspaces[^1];
         if (args.TryGetValue("name", out var name))
             ws.Name = name;
-        return JsonSerializer.Serialize(new { id = ws.Workspace.Id, name = ws.Name });
+
+        if (!args.TryGetValue("workingDirectory", out var cwd))
+            args.TryGetValue("cwd", out cwd);
+
+        if (!string.IsNullOrWhiteSpace(cwd))
+        {
+            ws.WorkingDirectory = cwd;
+            ws.Workspace.WorkingDirectory = cwd;
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            id = ws.Workspace.Id,
+            name = ws.Name,
+            workingDirectory = ws.WorkingDirectory ?? "",
+        });
     }
 
     private string HandleWorkspaceSelect(Dictionary<string, string> args)
@@ -500,10 +520,40 @@ public partial class MainViewModel : ObservableObject
         return JsonSerializer.Serialize(new { error = "Workspace not found" });
     }
 
+    private string HandleWorkspaceMove(bool next)
+    {
+        if (Workspaces.Count == 0)
+            return JsonSerializer.Serialize(new { error = "No workspaces available" });
+
+        if (next)
+            NextWorkspace();
+        else
+            PreviousWorkspace();
+
+        return JsonSerializer.Serialize(new
+        {
+            ok = true,
+            selectedWorkspace = new
+            {
+                id = SelectedWorkspace?.Workspace.Id,
+                name = SelectedWorkspace?.Name,
+                index = SelectedWorkspace != null ? Workspaces.IndexOf(SelectedWorkspace) + 1 : 0,
+            },
+        });
+    }
+
     private string HandleSurfaceCreate(Dictionary<string, string> args)
     {
         SelectedWorkspace?.CreateNewSurface();
-        return JsonSerializer.Serialize(new { ok = true });
+        var surface = SelectedWorkspace?.SelectedSurface;
+        return JsonSerializer.Serialize(new
+        {
+            ok = surface != null,
+            workspaceId = SelectedWorkspace?.Workspace.Id,
+            workspaceName = SelectedWorkspace?.Name,
+            surfaceId = surface?.Surface.Id,
+            surfaceName = surface?.Name,
+        });
     }
 
     private string HandleSurfaceSelect(Dictionary<string, string> args)
@@ -524,6 +574,32 @@ public partial class MainViewModel : ObservableObject
             workspaceName = workspace.Name,
             surfaceId = surface.Surface.Id,
             surfaceName = surface.Name,
+        });
+    }
+
+    private string HandleSurfaceMove(bool next)
+    {
+        var workspace = SelectedWorkspace;
+        if (workspace == null)
+            return JsonSerializer.Serialize(new { error = "No workspace selected" });
+
+        if (workspace.Surfaces.Count == 0)
+            return JsonSerializer.Serialize(new { error = "No surfaces available" });
+
+        if (next)
+            workspace.NextSurface();
+        else
+            workspace.PreviousSurface();
+
+        var surface = workspace.SelectedSurface;
+        return JsonSerializer.Serialize(new
+        {
+            ok = true,
+            workspaceId = workspace.Workspace.Id,
+            workspaceName = workspace.Name,
+            surfaceId = surface?.Surface.Id,
+            surfaceName = surface?.Name,
+            surfaceIndex = surface != null ? workspace.Surfaces.IndexOf(surface) + 1 : 0,
         });
     }
 
@@ -718,7 +794,35 @@ public partial class MainViewModel : ObservableObject
             version = "1.0.6",
             workspaces = Workspaces.Count,
             selectedWorkspace = SelectedWorkspace?.Workspace.Id,
+            selectedWorkspaceName = SelectedWorkspace?.Name,
+            selectedSurface = SelectedWorkspace?.SelectedSurface?.Surface.Id,
+            selectedSurfaceName = SelectedWorkspace?.SelectedSurface?.Name,
             unreadNotifications = TotalUnreadCount,
+        });
+    }
+
+    private string HandleRestoreSession()
+    {
+        var session = SessionPersistenceService.Load();
+        if (session == null || session.Workspaces.Count == 0)
+            return JsonSerializer.Serialize(new { error = "No saved session found" });
+
+        foreach (var workspace in Workspaces.ToList())
+            workspace.Dispose();
+
+        Workspaces.Clear();
+        SelectedWorkspace = null;
+        RestoreSession(session);
+
+        if (Workspaces.Count == 0)
+            CreateNewWorkspace();
+
+        return JsonSerializer.Serialize(new
+        {
+            ok = true,
+            workspaces = Workspaces.Count,
+            selectedWorkspace = SelectedWorkspace?.Workspace.Id,
+            selectedWorkspaceName = SelectedWorkspace?.Name,
         });
     }
 
